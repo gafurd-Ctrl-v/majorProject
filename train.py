@@ -1,21 +1,39 @@
 """
-train.py — Training loop for ECGAttentionNet.
+train.py — Training loop for ECGAttentionNet (improved v2).
 
-All hyperparameters and paths come from config.py.
-You should never need to edit this file — change config.py instead.
+Key changes vs v1:
+  1. CLASS-WEIGHTED FOCAL LOSS
+       Replaces plain BCEWithLogitsLoss.
+       • Pos-weight per class is computed from the training set label frequency,
+         so rare classes (MI, HYP) get amplified proportionally to their
+         under-representation — the single biggest fix for minority-class AUC.
+       • Focal modulation (gamma=2) further down-weights easy negatives so the
+         model is forced to learn harder examples.
+       Both can be disabled independently via FOCAL_GAMMA=0 / USE_CLASS_WEIGHTS=False
+       in config.py.
 
+  2. PER-CLASS THRESHOLD OPTIMISATION
+       After each epoch, the threshold that maximises F1 on the *validation set*
+       is searched independently for each class over [0.1, 0.9].
+       Best thresholds are logged and saved into the checkpoint.
+       At inference time, load thresholds from the checkpoint instead of using 0.5.
+
+  3. LABEL SMOOTHING
+       Labels are soft-clipped to [eps, 1-eps] with LABEL_SMOOTHING=0.05.
+       Reduces overconfidence and improves calibration.
+
+  4. COSINE ANNEALING WITH WARM RESTARTS (optional)
+       Set LR_SCHEDULER='cosine_restarts' in config.py to switch from OneCycleLR.
+       Useful for longer runs (>50 epochs) where OneCycleLR can prematurely
+       collapse the LR.
+
+  5. EARLY STOPPING
+       Stops if val macro-AUC does not improve for EARLY_STOPPING_PATIENCE epochs.
+       Set EARLY_STOPPING_PATIENCE=0 to disable.
+
+All defaults still come from config.py.
 Run:
   python train.py
-
-Metrics printed each epoch:
-  Loss        : train_loss, val_loss, and a trend arrow (↓ improving / ↑ worsening / → flat)
-  AUC         : per-class + macro (train and val)
-  F1          : per-class + macro (val only, at threshold 0.5)
-  LR          : current learning rate from the scheduler
-  VRAM        : GPU memory used / total (MB)
-  Time        : seconds per epoch
-
-End-of-training summary table shows best epoch and all final metrics.
 """
 
 import os
@@ -24,9 +42,10 @@ import argparse
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingWarmRestarts
 from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
 from tqdm import tqdm
 
@@ -53,6 +72,113 @@ from model   import ECGAttentionNet
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+# ── Optional config additions (safe defaults if not present in config.py) ──────
+
+def _cfg(name, default):
+    try:
+        import config as _c
+        return getattr(_c, name)
+    except AttributeError:
+        return default
+
+FOCAL_GAMMA            = _cfg('FOCAL_GAMMA',            2.0)    # 0 = plain BCE
+USE_CLASS_WEIGHTS      = _cfg('USE_CLASS_WEIGHTS',      True)
+LABEL_SMOOTHING        = _cfg('LABEL_SMOOTHING',        0.05)
+LR_SCHEDULER           = _cfg('LR_SCHEDULER',           'onecycle')  # or 'cosine_restarts'
+EARLY_STOPPING_PATIENCE= _cfg('EARLY_STOPPING_PATIENCE', 10)   # 0 = disabled
+COSINE_T0              = _cfg('COSINE_T0',              10)     # epochs per restart
+
+
+# ── Focal loss ─────────────────────────────────────────────────────────────────
+
+class FocalBCEWithLogitsLoss(nn.Module):
+    """
+    Binary focal loss (per-label, multi-label safe).
+
+    FL(p) = -α · (1-p)^γ · log(p)   for positives
+    FL(p) = -(1-α) · p^γ · log(1-p)  for negatives
+
+    pos_weight mirrors the BCEWithLogitsLoss convention:
+        pos_weight[c] = (#neg_c / #pos_c)  — applied as α_c.
+
+    gamma=0 reduces to weighted BCE (no focal modulation).
+    """
+
+    def __init__(self,
+                 pos_weight:     torch.Tensor | None = None,
+                 gamma:          float               = 2.0,
+                 label_smoothing: float              = 0.0):
+        super().__init__()
+        self.register_buffer('pos_weight', pos_weight)
+        self.gamma           = gamma
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Label smoothing
+        if self.label_smoothing > 0:
+            targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+
+        # Standard BCE per element
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets,
+            pos_weight=self.pos_weight,
+            reduction='none'
+        )
+
+        if self.gamma == 0:
+            return bce.mean()
+
+        # Focal modulation
+        p_t = torch.sigmoid(logits) * targets + (1 - torch.sigmoid(logits)) * (1 - targets)
+        focal_weight = (1 - p_t) ** self.gamma
+        return (focal_weight * bce).mean()
+
+
+def compute_pos_weights(train_loader, num_classes: int, device) -> torch.Tensor:
+    """
+    Compute pos_weight = (#neg / #pos) per class from training labels.
+    Clamped to [1, 50] to prevent extreme values.
+    """
+    print('  Computing class frequencies for pos_weight...')
+    pos_counts = torch.zeros(num_classes)
+    total      = 0
+
+    for _, labels in train_loader:
+        pos_counts += labels.sum(dim=0)
+        total      += labels.shape[0]
+
+    neg_counts  = total - pos_counts
+    pos_weights = (neg_counts / pos_counts.clamp(min=1)).clamp(1.0, 50.0)
+
+    for i, cls in enumerate(CLASSES):
+        print(f'    {cls}: pos={int(pos_counts[i])}, neg={int(neg_counts[i])}, '
+              f'pos_weight={pos_weights[i]:.2f}')
+
+    return pos_weights.to(device)
+
+
+# ── Per-class threshold search ─────────────────────────────────────────────────
+
+def find_best_thresholds(y_true: np.ndarray,
+                         y_pred: np.ndarray,
+                         search_values: np.ndarray = np.arange(0.1, 0.91, 0.02)
+                         ) -> np.ndarray:
+    """
+    For each class, search `search_values` for the threshold that maximises F1.
+    Returns array of shape (num_classes,).
+    """
+    best_thresh = np.full(y_true.shape[1], 0.5)
+    for c in range(y_true.shape[1]):
+        if y_true[:, c].sum() == 0:
+            continue
+        best_f1 = -1.0
+        for t in search_values:
+            f1 = f1_score(y_true[:, c], (y_pred[:, c] >= t).astype(int), zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_thresh[c] = f1, float(t)
+    return best_thresh
+
+
 # ── Device info ────────────────────────────────────────────────────────────────
 
 def print_device_info():
@@ -65,7 +191,6 @@ def print_device_info():
 
 
 def get_vram_str() -> str:
-    """Return current VRAM usage as 'used/total MB' string."""
     if DEVICE.type != 'cuda':
         return 'N/A'
     used  = torch.cuda.memory_allocated()  / 1e6
@@ -75,11 +200,7 @@ def get_vram_str() -> str:
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
 
-THRESHOLD = 0.5   # sigmoid threshold for F1 / precision / recall
-
-
 def compute_aucs(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """Per-class AUC + macro average. Skips classes with no positive labels."""
     aucs = {}
     for i, cls in enumerate(CLASSES):
         if y_true[:, i].sum() > 0:
@@ -88,9 +209,13 @@ def compute_aucs(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return aucs
 
 
-def compute_f1s(y_true: np.ndarray, y_pred_prob: np.ndarray) -> dict:
-    """Per-class F1 + macro F1 at THRESHOLD."""
-    y_bin = (y_pred_prob >= THRESHOLD).astype(int)
+def compute_f1s(y_true: np.ndarray,
+                y_pred_prob: np.ndarray,
+                thresholds: np.ndarray | None = None) -> dict:
+    """F1 per class. Uses per-class thresholds if provided, else 0.5."""
+    if thresholds is None:
+        thresholds = np.full(y_true.shape[1], 0.5)
+    y_bin = (y_pred_prob >= thresholds).astype(int)
     f1s = {}
     for i, cls in enumerate(CLASSES):
         if y_true[:, i].sum() > 0:
@@ -99,9 +224,12 @@ def compute_f1s(y_true: np.ndarray, y_pred_prob: np.ndarray) -> dict:
     return f1s
 
 
-def compute_precision_recall(y_true: np.ndarray, y_pred_prob: np.ndarray) -> tuple[dict, dict]:
-    """Per-class precision and recall at THRESHOLD."""
-    y_bin = (y_pred_prob >= THRESHOLD).astype(int)
+def compute_precision_recall(y_true: np.ndarray,
+                              y_pred_prob: np.ndarray,
+                              thresholds: np.ndarray | None = None) -> tuple[dict, dict]:
+    if thresholds is None:
+        thresholds = np.full(y_true.shape[1], 0.5)
+    y_bin = (y_pred_prob >= thresholds).astype(int)
     prec, rec = {}, {}
     for i, cls in enumerate(CLASSES):
         if y_true[:, i].sum() > 0:
@@ -113,21 +241,19 @@ def compute_precision_recall(y_true: np.ndarray, y_pred_prob: np.ndarray) -> tup
 
 
 def trend_arrow(current: float, previous: float | None, higher_is_better: bool = True) -> str:
-    """Return ↓ ↑ → based on whether the metric moved in the desired direction."""
     if previous is None:
         return ' '
     delta = current - previous
     if abs(delta) < 1e-4:
         return '→'
     improving = (delta > 0) if higher_is_better else (delta < 0)
-    return '↓' if (not higher_is_better and improving) or (higher_is_better and not improving) else '↑' if (not higher_is_better and not improving) or (higher_is_better and improving) else '→'
+    return '↑' if improving else '↓'
 
 
-def loss_trend(current: float, previous: float | None) -> str:
+def loss_trend(current, previous):
     return trend_arrow(current, previous, higher_is_better=False)
 
-
-def auc_trend(current: float, previous: float | None) -> str:
+def auc_trend(current, previous):
     return trend_arrow(current, previous, higher_is_better=True)
 
 
@@ -135,18 +261,13 @@ def auc_trend(current: float, previous: float | None) -> str:
 
 def run_epoch(model, loader, criterion,
               optimizer=None, scaler=None, scheduler=None,
-              training: bool = False) -> tuple[float, np.ndarray, np.ndarray]:
-    """
-    Unified train/eval pass.
-
-    Returns:
-        (avg_loss, all_labels, all_pred_probs)
-        shapes: scalar, (N, 5), (N, 5)
-    """
+              training: bool = False,
+              scheduler_step_per_batch: bool = True,
+              ) -> tuple[float, np.ndarray, np.ndarray]:
     model.train() if training else model.eval()
-    total_loss  = 0.0
-    all_preds   = []
-    all_labels  = []
+    total_loss = 0.0
+    all_preds  = []
+    all_labels = []
 
     ctx = torch.enable_grad() if training else torch.no_grad()
 
@@ -168,7 +289,8 @@ def run_epoch(model, loader, criterion,
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
+                if scheduler is not None and scheduler_step_per_batch:
+                    scheduler.step()
 
             total_loss += loss.item()
             all_preds.append(torch.sigmoid(logits).float().detach().cpu().numpy())
@@ -207,16 +329,18 @@ def print_epoch_row(epoch, epochs,
     )
 
 
-def print_per_class(v_aucs, v_f1s, v_prec, v_rec):
+def print_per_class(v_aucs, v_f1s, v_prec, v_rec, thresholds=None):
     print()
-    print(f"  {'Class':<6}  {'AUC':>6}  {'F1':>6}  {'Prec':>6}  {'Recall':>6}")
-    print("  " + "─" * 38)
-    for cls in CLASSES:
-        auc  = v_aucs.get(cls, float('nan'))
-        f1   = v_f1s.get(cls,  float('nan'))
-        p    = v_prec.get(cls, float('nan'))
-        r    = v_rec.get(cls,  float('nan'))
-        print(f"  {cls:<6}  {auc:>6.3f}  {f1:>6.3f}  {p:>6.3f}  {r:>6.3f}")
+    print(f"  {'Class':<6}  {'AUC':>6}  {'F1':>6}  {'Prec':>6}  {'Recall':>6}"
+          + (f"  {'Thresh':>6}" if thresholds is not None else ''))
+    print("  " + "─" * (38 + (9 if thresholds is not None else 0)))
+    for i, cls in enumerate(CLASSES):
+        auc = v_aucs.get(cls, float('nan'))
+        f1  = v_f1s.get(cls,  float('nan'))
+        p   = v_prec.get(cls, float('nan'))
+        r   = v_rec.get(cls,  float('nan'))
+        t_  = f"  {thresholds[i]:>6.2f}" if thresholds is not None else ''
+        print(f"  {cls:<6}  {auc:>6.3f}  {f1:>6.3f}  {p:>6.3f}  {r:>6.3f}{t_}")
     print(f"  {'macro':<6}  {v_aucs['macro']:>6.3f}  {v_f1s['macro']:>6.3f}  "
           f"{v_prec['macro']:>6.3f}  {v_rec['macro']:>6.3f}")
 
@@ -260,6 +384,17 @@ def train(data_dir:       str   = DATA_DIR,
         num_workers = num_workers,
     )
 
+    # ── Loss function ──────────────────────────────────────────────────────────
+    pos_weight = compute_pos_weights(train_loader, NUM_CLASSES, DEVICE) if USE_CLASS_WEIGHTS else None
+    criterion  = FocalBCEWithLogitsLoss(
+        pos_weight      = pos_weight,
+        gamma           = FOCAL_GAMMA,
+        label_smoothing = LABEL_SMOOTHING,
+    ).to(DEVICE)
+    print(f'\nLoss: FocalBCE  gamma={FOCAL_GAMMA}  label_smoothing={LABEL_SMOOTHING}')
+    print(f'Class weights : {"on" if USE_CLASS_WEIGHTS else "off"}')
+
+    # ── Model ──────────────────────────────────────────────────────────────────
     model = ECGAttentionNet(
         num_classes = NUM_CLASSES,
         base_ch     = BASE_CH,
@@ -270,54 +405,74 @@ def train(data_dir:       str   = DATA_DIR,
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Parameters: {n_params:,}')
 
-    criterion   = nn.BCEWithLogitsLoss()
+    # ── Optimiser & scheduler ──────────────────────────────────────────────────
     optimizer   = AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     total_steps = epochs * len(train_loader)
-    scheduler   = OneCycleLR(
-        optimizer,
-        max_lr          = lr,
-        total_steps     = total_steps,
-        pct_start       = LR_WARMUP_PCT,
-        anneal_strategy = 'cos',
-    )
+
+    if LR_SCHEDULER == 'cosine_restarts':
+        # Step per epoch, not per batch
+        scheduler             = CosineAnnealingWarmRestarts(optimizer, T_0=COSINE_T0)
+        scheduler_per_batch   = False
+        print(f'Scheduler: CosineAnnealingWarmRestarts  T_0={COSINE_T0}')
+    else:
+        scheduler           = OneCycleLR(
+            optimizer,
+            max_lr          = lr,
+            total_steps     = total_steps,
+            pct_start       = LR_WARMUP_PCT,
+            anneal_strategy = 'cos',
+        )
+        scheduler_per_batch = True
+        print(f'Scheduler: OneCycleLR  warmup={LR_WARMUP_PCT*100:.0f}%')
+
     scaler    = GradScaler(device=DEVICE.type)
     save_path = os.path.join(checkpoint_dir, os.path.basename(CHECKPOINT_PATH))
 
     print(f'\nTraining {epochs} epochs  batch={batch_size}  lr={lr}')
+    if EARLY_STOPPING_PATIENCE > 0:
+        print(f'Early stopping patience: {EARLY_STOPPING_PATIENCE} epochs')
     print_epoch_header()
 
-    best_val_auc  = 0.0
-    best_epoch    = 1
-    history       = []
-    prev_v_loss   = None
-    prev_v_auc    = None
+    best_val_auc     = 0.0
+    best_epoch       = 1
+    history          = []
+    prev_v_loss      = None
+    prev_v_auc       = None
+    no_improve_count = 0
+    best_thresholds  = np.full(NUM_CLASSES, 0.5)
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
 
-        # ── Train pass ───────────────────────────────────────────────────────
+        # ── Train pass ─────────────────────────────────────────────────────────
         t_loss, t_labels, t_preds = run_epoch(
             model, train_loader, criterion,
-            optimizer=optimizer, scaler=scaler, scheduler=scheduler,
-            training=True
+            optimizer=optimizer, scaler=scaler,
+            scheduler=scheduler if scheduler_per_batch else None,
+            training=True,
+            scheduler_step_per_batch=scheduler_per_batch,
         )
+        if not scheduler_per_batch:
+            scheduler.step()
 
-        # ── Val pass ─────────────────────────────────────────────────────────
+        # ── Val pass ───────────────────────────────────────────────────────────
         v_loss, v_labels, v_preds = run_epoch(
             model, val_loader, criterion, training=False
         )
 
         elapsed = time.time() - t0
 
-        # ── Compute all metrics ───────────────────────────────────────────────
-        t_aucs         = compute_aucs(t_labels, t_preds)
-        v_aucs         = compute_aucs(v_labels, v_preds)
-        v_f1s          = compute_f1s(v_labels, v_preds)
-        v_prec, v_rec  = compute_precision_recall(v_labels, v_preds)
-        current_lr     = scheduler.get_last_lr()[0]
-        vram           = get_vram_str()
+        # ── Per-class threshold search (on val set) ────────────────────────────
+        best_thresholds = find_best_thresholds(v_labels, v_preds)
 
-        # ── Print summary row ─────────────────────────────────────────────────
+        # ── Metrics ────────────────────────────────────────────────────────────
+        t_aucs        = compute_aucs(t_labels, t_preds)
+        v_aucs        = compute_aucs(v_labels, v_preds)
+        v_f1s         = compute_f1s(v_labels, v_preds, best_thresholds)
+        v_prec, v_rec = compute_precision_recall(v_labels, v_preds, best_thresholds)
+        current_lr    = optimizer.param_groups[0]['lr']
+        vram          = get_vram_str()
+
         print_epoch_row(
             epoch, epochs,
             t_loss, v_loss,
@@ -326,21 +481,23 @@ def train(data_dir:       str   = DATA_DIR,
             prev_v_loss, prev_v_auc
         )
 
-        # ── Print per-class breakdown every 5 epochs and at the last epoch ───
         if epoch % 5 == 0 or epoch == epochs:
-            print_per_class(v_aucs, v_f1s, v_prec, v_rec)
+            print_per_class(v_aucs, v_f1s, v_prec, v_rec, best_thresholds)
             print()
 
-        # ── Save best checkpoint ──────────────────────────────────────────────
+        # ── Save best checkpoint ───────────────────────────────────────────────
         if v_aucs['macro'] > best_val_auc:
-            best_val_auc = v_aucs['macro']
-            best_epoch   = epoch
+            best_val_auc     = v_aucs['macro']
+            best_epoch       = epoch
+            no_improve_count = 0
             torch.save({
                 'epoch':            epoch,
                 'model_state_dict': model.state_dict(),
                 'val_auc':          best_val_auc,
                 'val_aucs':         v_aucs,
                 'val_f1s':          v_f1s,
+                # ── NEW: save per-class thresholds with the checkpoint ──────────
+                'thresholds':       best_thresholds.tolist(),
                 'config': {
                     'BASE_CH':    BASE_CH,
                     'N_HEADS':    N_HEADS,
@@ -348,12 +505,18 @@ def train(data_dir:       str   = DATA_DIR,
                     'BATCH_SIZE': batch_size,
                     'EPOCHS':     epochs,
                     'LR':         lr,
+                    'FOCAL_GAMMA':            FOCAL_GAMMA,
+                    'USE_CLASS_WEIGHTS':      USE_CLASS_WEIGHTS,
+                    'LABEL_SMOOTHING':        LABEL_SMOOTHING,
                 }
             }, save_path)
             print(f"  ✓ New best  macro-AUC={best_val_auc:.4f}  macro-F1={v_f1s['macro']:.4f}"
                   f"  → {save_path}")
+            thresh_str = '  '.join(f'{c}:{best_thresholds[i]:.2f}' for i, c in enumerate(CLASSES))
+            print(f"    Thresholds: {thresh_str}")
+        else:
+            no_improve_count += 1
 
-        # ── Store history for end summary ─────────────────────────────────────
         history.append({
             'epoch':  epoch,
             't_loss': t_loss,
@@ -366,6 +529,11 @@ def train(data_dir:       str   = DATA_DIR,
         prev_v_loss = v_loss
         prev_v_auc  = v_aucs['macro']
 
+        # ── Early stopping ─────────────────────────────────────────────────────
+        if EARLY_STOPPING_PATIENCE > 0 and no_improve_count >= EARLY_STOPPING_PATIENCE:
+            print(f'\n  ⚡ Early stopping triggered — no improvement for {EARLY_STOPPING_PATIENCE} epochs.')
+            break
+
     print_summary(history, best_epoch)
     return model
 
@@ -374,7 +542,7 @@ def train(data_dir:       str   = DATA_DIR,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Train ECGAttentionNet. Defaults come from config.py.')
+        description='Train ECGAttentionNet v2. Defaults come from config.py.')
     parser.add_argument('--data_dir',       type=str,   default=DATA_DIR)
     parser.add_argument('--epochs',         type=int,   default=EPOCHS)
     parser.add_argument('--batch_size',     type=int,   default=BATCH_SIZE,

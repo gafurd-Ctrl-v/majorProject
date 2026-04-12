@@ -6,11 +6,14 @@ import torch
 import wfdb
 import streamlit as st
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 
 from config import (
     DATA_DIR, CHECKPOINT_PATH, FS, SIGNAL_LEN,
-    CLASSES, CLASS_NAMES, LEAD_NAMES,
+    CLASSES, CLASS_NAMES, CLASS_SUPERCLASS, LEAD_NAMES,
     NUM_CLASSES, BASE_CH, N_HEADS, DROPOUT, TOP_K_LEADS,
 )
 from dataset          import bandpass_filter, instance_normalize, pad_or_crop
@@ -22,18 +25,26 @@ from diagnosis_engine import run_diagnosis_engine
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-st.set_page_config(page_title='ECG Attention Analyzer', page_icon='🫀', layout='wide')
+st.set_page_config(page_title='ECG Attention Analyzer', layout='wide')
 
 
 # ── Cached model ───────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner='Loading model…')
-def load_model(checkpoint_path: str) -> ECGAttentionNet:
+def load_model(checkpoint_path: str) -> tuple:
     model = ECGAttentionNet(num_classes=NUM_CLASSES, base_ch=BASE_CH,
                             nhead=N_HEADS, dropout=DROPOUT)
     ckpt  = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
     model.load_state_dict(ckpt['model_state_dict'])
-    return model.to(DEVICE).eval()
+    thresholds = (np.array(ckpt['thresholds'], dtype=np.float32)
+                  if 'thresholds' in ckpt
+                  else np.full(NUM_CLASSES, 0.5, dtype=np.float32))
+    return model.to(DEVICE).eval(), thresholds
+
+
+@st.cache_resource(show_spinner=False)
+def load_grad_cam(_model) -> GradCAM1D:
+    return GradCAM1D(_model)
 
 
 # ── Signal loading ─────────────────────────────────────────────────────────────
@@ -83,9 +94,10 @@ def load_from_csv_upload(csv_file) -> np.ndarray:
 
 def plot_12_lead(signal:  np.ndarray,
                  heatmap: np.ndarray | None = None,
-                 title:   str = '12-Lead ECG') -> plt.Figure:
-    fig, axes = plt.subplots(6, 2, figsize=(16, 12))
+                 title:   str = '12-Lead ECG') -> Figure:
+    fig = Figure(figsize=(16, 12))
     fig.suptitle(title, fontsize=12)
+    axes = fig.subplots(6, 2)
     t = np.arange(SIGNAL_LEN) / FS
 
     for i, ax in enumerate(axes.flatten()):
@@ -102,13 +114,14 @@ def plot_12_lead(signal:  np.ndarray,
         ax.tick_params(labelsize=6)
         ax.grid(True, alpha=0.25, linewidth=0.4)
 
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 
 # ── Analysis pipeline ──────────────────────────────────────────────────────────
 
-def run_analysis(model, grad_cam, signal_np: np.ndarray, source_label: str):
+def run_analysis(model, grad_cam, signal_np: np.ndarray,
+                 source_label: str, thresholds: np.ndarray):
     signal_t = torch.FloatTensor(signal_np).unsqueeze(0).to(DEVICE)
 
     with st.spinner('Running inference…'):
@@ -119,10 +132,12 @@ def run_analysis(model, grad_cam, signal_np: np.ndarray, source_label: str):
     top_cls_idx = int(np.argmax(probs))
     top_cls     = CLASSES[top_cls_idx]
     top_conf    = probs[top_cls_idx]
+    top_thresh  = float(thresholds[top_cls_idx])
 
     with st.spinner('Computing Grad-CAM and Attention Rollout…'):
+        model.zero_grad()
         heatmap         = grad_cam.generate(signal_t, class_idx=top_cls_idx)
-        lead_importance = compute_lead_importance(model, signal_t)
+        lead_importance = compute_lead_importance(model, signal_t, top_cls_idx)
 
     with st.spinner('Extracting clinical intervals…'):
         metrics = extract_clinical_metrics(signal_np)
@@ -130,15 +145,19 @@ def run_analysis(model, grad_cam, signal_np: np.ndarray, source_label: str):
     sub_diagnoses = run_diagnosis_engine(predictions, lead_importance, metrics)
 
     # ── Clinical metrics row ──────────────────────────────────────────────────
+    is_positive = top_conf >= top_thresh
     st.subheader(
-        f'Primary finding: {CLASS_NAMES[top_cls]} — {top_conf * 100:.1f}% confidence')
-    st.caption(f'Source: {source_label}')
+        f'Primary finding: {CLASS_NAMES.get(top_cls, top_cls)} — '
+        f'{top_conf * 100:.1f}% confidence'
+        + ('' if is_positive else ' (below threshold)')
+    )
+    st.caption(f'Source: {source_label}  ·  threshold: {top_thresh:.2f}')
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric('Heart Rate',   f"{metrics['hr']} bpm"          if metrics['hr']           else '—')
-    c2.metric('PR Interval',  f"{metrics['pr_interval']} ms"   if metrics['pr_interval']  else '—')
-    c3.metric('QRS Duration', f"{metrics['qrs_duration']} ms"  if metrics['qrs_duration'] else '—')
-    c4.metric('QTc',          f"{metrics['qtc']} ms"           if metrics['qtc']          else '—')
+    c1.metric('Heart Rate',   f"{metrics['hr']} bpm"          if metrics.get('hr')           else '—')
+    c2.metric('PR Interval',  f"{metrics['pr_interval']} ms"   if metrics.get('pr_interval')  else '—')
+    c3.metric('QRS Duration', f"{metrics['qrs_duration']} ms"  if metrics.get('qrs_duration') else '—')
+    c4.metric('QTc',          f"{metrics['qtc']} ms"           if metrics.get('qtc')          else '—')
 
     st.divider()
 
@@ -148,10 +167,9 @@ def run_analysis(model, grad_cam, signal_np: np.ndarray, source_label: str):
     fig = plot_12_lead(
         signal_np,
         heatmap if show_cam else None,
-        title=f'{CLASS_NAMES[top_cls]} ({top_conf * 100:.1f}%)  —  {source_label}'
+        title=f'{CLASS_NAMES.get(top_cls, top_cls)} ({top_conf * 100:.1f}%)  —  {source_label}'
     )
     st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
 
     st.divider()
 
@@ -165,7 +183,7 @@ def run_analysis(model, grad_cam, signal_np: np.ndarray, source_label: str):
         lead_importance = lead_importance,
         predictions     = predictions,
         top_cls         = top_cls,
-        sub_diagnoses   = sub_diagnoses,
+        sub_diagnoses   = sub_diagnoses[:2],
     )
 
 
@@ -201,8 +219,8 @@ def main():
         )
         st.stop()
 
-    model    = load_model(checkpoint_path)
-    grad_cam = GradCAM1D(model)
+    model, thresholds = load_model(checkpoint_path)
+    grad_cam          = load_grad_cam(model)
 
     # ── Mode 1: PTB-XL record path ────────────────────────────────────────────
     if input_mode == 'PTB-XL record path':
@@ -232,7 +250,8 @@ def main():
                 except Exception as exc:
                     st.error(f'Load failed: {exc}')
                     st.stop()
-            run_analysis(model, grad_cam, signal_np, source_label=record_rel)
+            run_analysis(model, grad_cam, signal_np, source_label=record_rel,
+                         thresholds=thresholds)
 
     # ── Mode 2: Upload WFDB ───────────────────────────────────────────────────
     elif input_mode == 'Upload WFDB files (.hea + .dat)':
@@ -258,7 +277,8 @@ def main():
                         st.error(f'Failed to parse WFDB files: {exc}')
                         st.stop()
                 run_analysis(model, grad_cam, signal_np,
-                             source_label=f'Uploaded: {hea_file.name}')
+                             source_label=f'Uploaded: {hea_file.name}',
+                             thresholds=thresholds)
         else:
             st.info('Upload both the `.hea` and `.dat` files to proceed.')
 
@@ -287,7 +307,8 @@ def main():
                     f'({signal_np.shape[1]/FS:.1f}s at {FS}Hz)'
                 )
                 run_analysis(model, grad_cam, signal_np,
-                             source_label=f'Uploaded: {csv_file.name}')
+                             source_label=f'Uploaded: {csv_file.name}',
+                             thresholds=thresholds)
         else:
             st.info('Upload a CSV file to proceed.')
 
