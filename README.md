@@ -82,16 +82,26 @@ The sidebar pre-fills with `DATA_DIR` and `CHECKPOINT_PATH` from `config.py`.
 
 ## Architecture
 
-| Stage | Output shape |
-|---|---|
-| Input | (B, 12, 5000) |
-| ResNet-1D backbone (3 blocks, BASE_CH=32) | (B×12, 256, 157) |
-| Global avg pool | (B, 12, 256) |
-| + Lead positional encoding | (B, 12, 256) |
-| Multi-Head Attention (N_HEADS=4) | (B, 12, 256) |
-| Feed-forward sublayer | (B, 12, 256) |
-| Mean pool over leads | (B, 256) |
-| Classifier head | (B, 5) |
+================================================================================
+                          DIMENSION FLOW THROUGH MODEL
+================================================================================
+
+Step                           Operation                           Shape
+-------------------------------------------------------------------------------------
+1                              Input                               (1, 12, 5000)
+2                              Reshape (combine batch & leads)     (12, 1, 5000)
+3                              Backbone CNN                        (12, 512, 79)       
+4                              Global avg pooling (over time)      (12, 512)
+5                              Reshape back (separate leads)       (1, 12, 512)
+6                              Add positional encoding             (1, 12, 512)
+7.1                            Attention layer 1                   (1, 12, 512)        
+7.2                            Attention layer 2                   (1, 12, 512)        
+8                              Mean over leads dimension           (1, 512)
+9                              Classification head                 (1, 27)
+
+✅ Final output shape: (1, 27)
+   (Batch size, 27 classes)
+================================================================================
 
 ~2.1 M parameters total.
 
