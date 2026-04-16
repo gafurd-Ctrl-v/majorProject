@@ -98,7 +98,7 @@ The sidebar pre-fills with `DATA_DIR` and `CHECKPOINT_PATH` from `config.py`.
 
 **✅ Final Output:** `(1, 27)` - Batch size 1, 27 classes
 
-~2.1 M parameters total.
+~ 27.5 million parameters total.
 
 ---
 
