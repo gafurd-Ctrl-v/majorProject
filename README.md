@@ -81,27 +81,22 @@ The sidebar pre-fills with `DATA_DIR` and `CHECKPOINT_PATH` from `config.py`.
 ---
 
 ## Architecture
+## ECGAttentionNet Dimension Flow
 
-================================================================================
-                          DIMENSION FLOW THROUGH MODEL
-================================================================================
+| Step | Operation | Shape | Description |
+|------|-----------|-------|-------------|
+| 1 | Input | `(1, 12, 5000)` | Raw 12-lead ECG signal |
+| 2 | Reshape (combine batch & leads) | `(12, 1, 5000)` | Prepare for per-lead CNN processing |
+| 3 | Backbone CNN | `(12, 512, 79)` | Extract temporal features from each lead |
+| 4 | Global avg pooling (over time) | `(12, 512)` | Pool temporal dimension |
+| 5 | Reshape back (separate leads) | `(1, 12, 512)` | Separate leads for attention |
+| 6 | Add positional encoding | `(1, 12, 512)` | Add learnable lead positions |
+| 7.1 | Attention layer 1 | `(1, 12, 512)` | Lead-lead interaction (Layer 1) |
+| 7.2 | Attention layer 2 | `(1, 12, 512)` | Lead-lead interaction (Layer 2) |
+| 8 | Mean over leads dimension | `(1, 512)` | Aggregate lead information |
+| 9 | Classification head | `(1, 27)` | Final logits for 27 classes |
 
-Step                           Operation                           Shape
--------------------------------------------------------------------------------------
-1                              Input                               (1, 12, 5000)
-2                              Reshape (combine batch & leads)     (12, 1, 5000)
-3                              Backbone CNN                        (12, 512, 79)       
-4                              Global avg pooling (over time)      (12, 512)
-5                              Reshape back (separate leads)       (1, 12, 512)
-6                              Add positional encoding             (1, 12, 512)
-7.1                            Attention layer 1                   (1, 12, 512)        
-7.2                            Attention layer 2                   (1, 12, 512)        
-8                              Mean over leads dimension           (1, 512)
-9                              Classification head                 (1, 27)
-
-✅ Final output shape: (1, 27)
-   (Batch size, 27 classes)
-================================================================================
+**✅ Final Output:** `(1, 27)` - Batch size 1, 27 classes
 
 ~2.1 M parameters total.
 
