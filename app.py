@@ -190,8 +190,8 @@ def run_analysis(model, grad_cam, signal_np: np.ndarray,
 # ── Main UI ────────────────────────────────────────────────────────────────────
 
 def main():
-    st.title('ECG Attention Analyzer')
-    st.caption('ResNet-1D + Multi-Head Attention | PTB-XL | Grad-CAM + Attention Rollout')
+    st.title('ECG  Analyzer')
+    st.caption('ResNet-1D Style Architecture + Multi-Head | PTB-XL | Grad-CAM')
 
     with st.sidebar:
         st.header('Configuration')
